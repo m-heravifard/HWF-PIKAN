@@ -1,0 +1,534 @@
+"""
+Authors: Mohammad E. Heravifard & Prof. Kazem Hejranfar
+HWF-PIKAN solver for 2D linear advection using PyTorch.
+
+PDE:
+    u_t + c_x * u_x + c_y * u_y = 0
+
+Domain:
+    (x, y) in [0,1] x [0,1], t in [0, T]
+
+Initial condition (example):
+    u(x,y,0) = sin(2*pi*(x + y))
+
+Boundary conditions:
+    periodic in x and y (u(0,y,t)=u(1,y,t), u(x,0,t)=u(x,1,t))
+
+Architecture:
+- Hybrid Wavelet-Fourier (HWF) embedding on input z = [x, y, t]
+  (Fourier sin/cos projections + localized Ricker (Mexican-hat) wavelet features)
+- PIKAN / Kolmogorov-Arnold core (KA): inner linear maps -> s_q,
+  univariate phi_q(s) represented by B-spline basis (trainable coeffs),
+  outer linear combination yields u.
+- Physics-informed losses: PDE residual, IC, periodic BCs.
+- Uses automatic differentiation to compute u_x, u_y, u_t.
+
+Notes:
+- This script is a reasonably self-contained working example. Hyperparameters
+  at the top can be changed for accuracy / speed tradeoffs.
+- For larger experiments, increase collocation points, model capacity, and training epochs.
+
+Usage:
+    python hwf_pikan_advection_2d.py
+"""
+import time
+from typing import Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ---------------------
+# Configuration / Hyperparameters
+# ---------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(1234)
+np.random.seed(1234)
+
+# PDE parameters: constant advection velocity
+c_x = 1.0
+c_y = 0.5
+
+# Domain
+x_min, x_max = 0.0, 1.0
+y_min, y_max = 0.0, 1.0
+t_min, t_max = 0.0, 0.5
+
+# Training data sizes (tune these)
+N_ic = 400      # initial condition points
+N_bc = 400      # boundary points per boundary type (we sample paired points)
+N_f = 6000      # collocation points for PDE residual
+
+# Training hyperparams
+learning_rate = 5e-4
+epochs_adam = 3000
+use_lbfgs = True
+
+# HWF embedding hyperparams
+M_fourier = 32     # number of Fourier frequency vectors
+sigma_B = 1.0      # std of Gaussian for frequency sampling
+train_omega = False
+
+# Wavelet hyperparams
+J_wavelet = 3      # number of scales for separate-coordinate wavelet features
+
+# PIKAN core hyperparams
+Q = 16             # number of Kolmogorov inner terms
+bspline_degree = 3
+n_control = 25
+
+# Misc
+print_interval = 250
+
+# ---------------------
+# Utilities / analytic solution
+# ---------------------
+def analytic_solution(x: np.ndarray, y: np.ndarray, t: np.ndarray, cx=c_x, cy=c_y) -> np.ndarray:
+    """
+    Analytic solution for IC u(x,y,0)=sin(2*pi*(x+y)) with constant velocity (cx,cy)
+    periodic domain: u(x,y,t) = sin(2*pi*(x + y - (cx+cy)*t))
+    """
+    return np.sin(2.0 * np.pi * (x + y - (cx + cy) * t))
+
+
+def to_tensor(arr, dtype=torch.float32, device=device, requires_grad=False):
+    return torch.tensor(arr, dtype=dtype, device=device, requires_grad=requires_grad)
+
+
+# ---------------------
+# B-spline basis (Cox-de Boor) implemented in PyTorch
+# ---------------------
+def make_open_uniform_knots(num_control: int, degree: int, device=device):
+    n_knots = num_control + degree + 1
+    if n_knots <= 2 * (degree + 1):
+        knots = torch.linspace(0.0, 1.0, steps=n_knots, device=device)
+    else:
+        n_internal = n_knots - 2 * (degree + 1)
+        internal = torch.linspace(0.0, 1.0, steps=n_internal + 2, device=device)[1:-1]
+        knots = torch.cat([
+            torch.zeros(degree + 1, device=device),
+            internal,
+            torch.ones(degree + 1, device=device)
+        ])
+    return knots
+
+
+def bspline_basis_batch(x: torch.Tensor, degree: int, knots: torch.Tensor):
+    """
+    Evaluate all B-spline basis functions N_i^degree(x) for x in [0,1] (vectorized).
+    x: (M,) -> return (M, n_basis)
+    """
+    x = x.clamp(min=knots[0].item(), max=knots[-1].item())
+    n_knots = knots.shape[0]
+    n_basis = n_knots - degree - 1
+    M = x.shape[0]
+
+    N = torch.zeros((M, n_basis), dtype=x.dtype, device=x.device)
+    for i in range(n_basis):
+        left = knots[i]
+        right = knots[i + 1]
+        if i == n_basis - 1:
+            mask = (x >= left) & (x <= right)
+        else:
+            mask = (x >= left) & (x < right)
+        N[:, i] = mask.to(dtype=x.dtype)
+
+    for p in range(1, degree + 1):
+        Np = torch.zeros_like(N)
+        for i in range(n_basis):
+            denom1 = knots[i + p] - knots[i]
+            denom2 = knots[i + p + 1] - knots[i + 1]
+
+            term1 = torch.zeros(M, dtype=x.dtype, device=x.device)
+            term2 = torch.zeros(M, dtype=x.dtype, device=x.device)
+
+            if denom1 != 0:
+                coeff1 = (x - knots[i]) / denom1
+                term1 = coeff1 * N[:, i]
+
+            if i + 1 < n_basis and denom2 != 0:
+                coeff2 = (knots[i + p + 1] - x) / denom2
+                term2 = coeff2 * N[:, i + 1]
+
+            Np[:, i] = term1 + term2
+        N = Np
+    return N  # (M, n_basis)
+
+
+# ---------------------
+# Wavelet features (Ricker) applied per coordinate and concatenated
+# ---------------------
+def ricker_wavelet(s: torch.Tensor, scale: float):
+    u = s / scale
+    return (1.0 - u * u) * torch.exp(-0.5 * u * u)
+
+
+def wavelet_features_nd(z: torch.Tensor, J: int):
+    """
+    z: (N, D) where D = 3 (x,y,t)
+    For each coordinate separately compute wavelet features across scales and translations,
+    then concatenate.
+    Output shape: (N, total_wavelet_features)
+    total_wavelet_features = D * sum_{j=0..J-1} 2^j = D*(2^J - 1)
+    (we use num translations = 2^j per coordinate)
+    """
+    N, D = z.shape
+    features = []
+    for dim in range(D):
+        coord = z[:, dim]
+        feats_coord = []
+        for j in range(J):
+            num_k = 2 ** j
+            # scale chosen so wavelet supports are reasonable relative to domain
+            scale = max(0.4 / num_k, 1e-3)
+            centers = torch.tensor([(k + 0.5) / num_k for k in range(num_k)], device=z.device, dtype=z.dtype)
+            u = coord.unsqueeze(1) - centers.unsqueeze(0)  # (N, num_k)
+            psi = ricker_wavelet(u, scale)  # (N, num_k)
+            feats_coord.append(psi)
+        if feats_coord:
+            features.append(torch.cat(feats_coord, dim=1))  # (N, sum 2^j)
+    if not features:
+        return torch.zeros((N, 0), device=z.device, dtype=z.dtype)
+    return torch.cat(features, dim=1)
+
+
+# ---------------------
+# Fourier features for input z (sin/cos projections)
+# ---------------------
+class FourierFeatures(nn.Module):
+    def __init__(self, in_dim: int, M: int, sigma: float = 1.0, trainable: bool = False):
+        super().__init__()
+        B = torch.randn(M, in_dim) * sigma
+        if trainable:
+            self.B = nn.Parameter(B)
+        else:
+            self.register_buffer("B", B)
+        self.two_pi = 2.0 * np.pi
+        self.M = M
+
+    def forward(self, z: torch.Tensor):
+        # z: (N, in_dim)
+        B = self.B
+        proj = self.two_pi * (z @ B.t())  # (N, M)
+        sinp = torch.sin(proj)
+        cosp = torch.cos(proj)
+        scale = 1.0 / (np.sqrt(self.M) + 1e-12)
+        return torch.cat([sinp * scale, cosp * scale], dim=1)  # (N, 2M)
+
+
+# ---------------------
+# HWF Embedding (Fourier + Wavelet) with normalization
+# ---------------------
+class HWFEmbedding(nn.Module):
+    def __init__(self, in_dim: int, M_fourier: int, sigma_B: float, J_wavelet: int, trainable: bool = False):
+        super().__init__()
+        self.fourier = FourierFeatures(in_dim, M_fourier, sigma=sigma_B, trainable=trainable)
+        self.J = J_wavelet
+        # wavelet features per coordinate: sum_{j=0..J-1} 2^j = 2^J - 1 per coord
+        self.wavelet_per_coord = 0 if J_wavelet == 0 else (2 ** J_wavelet) - 1
+        self.wavelet_size = in_dim * self.wavelet_per_coord
+        self.out_dim = 2 * M_fourier + self.wavelet_size
+        self.norm = nn.LayerNorm(self.out_dim) if self.out_dim > 0 else None
+
+    def forward(self, z: torch.Tensor):
+        F = self.fourier(z)  # (N, 2M)
+        if self.J > 0:
+            W = wavelet_features_nd(z, self.J)  # (N, wavelet_size)
+            emb = torch.cat([F, W], dim=1)
+        else:
+            emb = F
+        if self.norm is not None:
+            emb = self.norm(emb)
+        return emb
+
+
+# ---------------------
+# KA-BSpline Core (accepts embedding)
+# ---------------------
+class KA_BSpline_Core(nn.Module):
+    def __init__(self, input_dim: int, Q: int, degree: int, n_control: int):
+        super().__init__()
+        self.Q = Q
+        self.degree = degree
+        self.n_control = n_control
+
+        # inner linear maps (small init)
+        self.W = nn.Parameter(torch.randn(Q, input_dim) * 0.05)
+        self.b_inner = nn.Parameter(torch.zeros(Q))
+        self.inner_scale = nn.Parameter(torch.tensor(0.5))
+
+        # spline coefficients (small init)
+        self.coeffs = nn.Parameter(torch.randn(Q, n_control) * 0.05)
+
+        # outer scalars
+        self.a = nn.Parameter(torch.randn(Q, 1) * 0.05)
+        self.b_out = nn.Parameter(torch.zeros(1))
+
+        knots = make_open_uniform_knots(n_control, degree, device=device)
+        self.register_buffer("knots", knots)
+
+    def forward(self, emb: torch.Tensor):
+        N = emb.shape[0]
+        u_inner = emb @ self.W.t() + self.b_inner  # (N, Q)
+        s = 0.5 * (torch.tanh(self.inner_scale * u_inner) + 1.0)  # (N, Q) in (0,1)
+
+        s_flat = s.reshape(-1)  # (N*Q,)
+        B_flat = bspline_basis_batch(s_flat, self.degree, self.knots)  # (N*Q, n_control)
+        B = B_flat.reshape(N, self.Q, self.n_control)  # (N, Q, n_control)
+
+        coeffs = self.coeffs.unsqueeze(0).expand(N, -1, -1)  # (N, Q, n_control)
+        phi = (B * coeffs).sum(dim=-1)  # (N, Q)
+
+        a = self.a.view(1, self.Q)
+        u_out = (phi * a).sum(dim=1, keepdim=True) + self.b_out  # (N,1)
+        return u_out
+
+
+# ---------------------
+# Full HWF-PIKAN model for 2D advection (input dim = 3: x,y,t)
+# ---------------------
+class HWF_PIKAN_2D(nn.Module):
+    def __init__(self,
+                 in_dim: int,
+                 M_fourier: int,
+                 sigma_B: float,
+                 J_wavelet: int,
+                 train_omega: bool,
+                 Q: int,
+                 degree: int,
+                 n_control: int):
+        super().__init__()
+        self.embedding = HWFEmbedding(in_dim, M_fourier, sigma_B, J_wavelet, trainable=train_omega)
+        emb_dim = self.embedding.out_dim
+        self.core = KA_BSpline_Core(emb_dim, Q, degree, n_control)
+
+    def forward(self, xyt: torch.Tensor):
+        emb = self.embedding(xyt)
+        return self.core(emb)
+
+
+# ---------------------
+# PDE residual computation (u_t + c_x u_x + c_y u_y)
+# ---------------------
+def pde_residual(model: nn.Module, x_f: torch.Tensor, y_f: torch.Tensor, t_f: torch.Tensor) -> torch.Tensor:
+    x_f = x_f.reshape(-1, 1)
+    y_f = y_f.reshape(-1, 1)
+    t_f = t_f.reshape(-1, 1)
+    xty = torch.cat([x_f, y_f, t_f], dim=1)
+    xty.requires_grad_(True)
+
+    u = model(xty)  # (N,1)
+
+    grads = torch.autograd.grad(
+        outputs=u,
+        inputs=xty,
+        grad_outputs=torch.ones_like(u),
+        retain_graph=True,
+        create_graph=True,
+    )[0]  # (N,3): du/dx, du/dy, du/dt
+
+    u_x = grads[:, 0:1]
+    u_y = grads[:, 1:1+1]
+    u_t = grads[:, 2:3]
+
+    r = u_t + c_x * u_x + c_y * u_y
+    return r
+
+
+# ---------------------
+# Data samplers (IC, BC, collocation)
+# ---------------------
+def sampler_ic(n_ic: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    sample (x,y,t=0) and u_ic
+    """
+    x_ic = np.random.rand(n_ic, 1) * (x_max - x_min) + x_min
+    y_ic = np.random.rand(n_ic, 1) * (y_max - y_min) + y_min
+    t_ic = np.zeros_like(x_ic)
+    u_ic = analytic_solution(x_ic, y_ic, t_ic)
+    return to_tensor(x_ic), to_tensor(y_ic), to_tensor(t_ic), to_tensor(u_ic)
+
+
+def sampler_bc_pairs(n_bc: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    For periodic BCs, sample pairs:
+      - x-boundary pairs: (x=0,y,t) and (x=1,y,t)
+      - y-boundary pairs: (x,y=0,t) and (x,y=1,t)
+    We'll return arrays so the training code can form xt pairs and compute u(0,y,t)-u(1,y,t) etc.
+    """
+    t_bc = np.random.rand(n_bc, 1) * (t_max - t_min) + t_min
+    y_bc = np.random.rand(n_bc, 1) * (y_max - y_min) + y_min
+    x0 = np.zeros_like(t_bc) + x_min
+    x1 = np.zeros_like(t_bc) + x_max
+    # for y-boundaries:
+    x_bc = np.random.rand(n_bc, 1) * (x_max - x_min) + x_min
+    y0 = np.zeros_like(t_bc) + y_min
+    y1 = np.zeros_like(t_bc) + y_max
+    return to_tensor(x0), to_tensor(x1), to_tensor(y_bc), to_tensor(t_bc), to_tensor(x_bc), to_tensor(y0), to_tensor(y1)
+
+
+def sampler_collocation(n_f: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_f = np.random.rand(n_f, 1) * (x_max - x_min) + x_min
+    y_f = np.random.rand(n_f, 1) * (y_max - y_min) + y_min
+    t_f = np.random.rand(n_f, 1) * (t_max - t_min) + t_min
+    return to_tensor(x_f), to_tensor(y_f), to_tensor(t_f)
+
+
+# ---------------------
+# Training loop
+# ---------------------
+def train():
+    model = HWF_PIKAN_2D(in_dim=3,
+                         M_fourier=M_fourier,
+                         sigma_B=sigma_B,
+                         J_wavelet=J_wavelet,
+                         train_omega=train_omega,
+                         Q=Q,
+                         degree=bspline_degree,
+                         n_control=n_control).to(device)
+
+    mse_loss = nn.MSELoss()
+
+    # Prepare data
+    x_ic, y_ic, t_ic, u_ic = sampler_ic(N_ic)
+    x0_bc, x1_bc, y_bc, t_bc, x_bc, y0_bc, y1_bc = sampler_bc_pairs(N_bc)
+    x_f, y_f, t_f = sampler_collocation(N_f)
+
+    # Move to device
+    x_ic, y_ic, t_ic, u_ic = x_ic.to(device), y_ic.to(device), t_ic.to(device), u_ic.to(device)
+    x0_bc, x1_bc, y_bc, t_bc = x0_bc.to(device), x1_bc.to(device), y_bc.to(device), t_bc.to(device)
+    x_bc, y0_bc, y1_bc = x_bc.to(device), y0_bc.to(device), y1_bc.to(device)
+    x_f, y_f, t_f = x_f.to(device), y_f.to(device), t_f.to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    start_time = time.time()
+    print(f"Training HWF-PIKAN-2D on device={device} | Q={Q}, M_fourier={M_fourier}, J_wavelet={J_wavelet}, n_control={n_control}")
+    for ep in range(1, epochs_adam + 1):
+        model.train()
+        optimizer.zero_grad()
+
+        # IC loss
+        xt_ic = torch.cat([x_ic, y_ic, t_ic], dim=1)
+        u_pred_ic = model(xt_ic)
+        loss_ic = mse_loss(u_pred_ic, u_ic)
+
+        # BC loss - periodic in x: u(0,y,t) == u(1,y,t)
+        xt_x0 = torch.cat([x0_bc, y_bc, t_bc], dim=1)
+        xt_x1 = torch.cat([x1_bc, y_bc, t_bc], dim=1)
+        u_x0 = model(xt_x0)
+        u_x1 = model(xt_x1)
+        loss_bc_x = mse_loss(u_x0, u_x1)
+
+        # BC loss - periodic in y: u(x,0,t) == u(x,1,t)
+        xt_y0 = torch.cat([x_bc, y0_bc, t_bc], dim=1)
+        xt_y1 = torch.cat([x_bc, y1_bc, t_bc], dim=1)
+        u_y0 = model(xt_y0)
+        u_y1 = model(xt_y1)
+        loss_bc_y = mse_loss(u_y0, u_y1)
+
+        # PDE residual loss
+        r = pde_residual(model, x_f, y_f, t_f)
+        loss_pde = mse_loss(r, torch.zeros_like(r))
+
+        loss = loss_ic + loss_bc_x + loss_bc_y + loss_pde
+        loss.backward()
+        optimizer.step()
+
+        if ep % print_interval == 0 or ep == 1 or ep == epochs_adam:
+            elapsed = time.time() - start_time
+            print(f"Epoch {ep}/{epochs_adam} | loss={loss.item():.3e} (ic={loss_ic.item():.3e}, "
+                  f"bc_x={loss_bc_x.item():.3e}, bc_y={loss_bc_y.item():.3e}, pde={loss_pde.item():.3e}) | time={elapsed:.1f}s")
+
+    # Optional LBFGS
+    if use_lbfgs:
+        print("Starting LBFGS fine-tuning...")
+        optimizer_lbfgs = optim.LBFGS(model.parameters(), lr=0.6, max_iter=300, max_eval=500,
+                                      history_size=50, tolerance_grad=1e-9, tolerance_change=1e-9)
+
+        def closure():
+            optimizer_lbfgs.zero_grad()
+            xt_ic = torch.cat([x_ic, y_ic, t_ic], dim=1)
+            u_pred_ic = model(xt_ic)
+            loss_ic_ = mse_loss(u_pred_ic, u_ic)
+
+            xt_x0 = torch.cat([x0_bc, y_bc, t_bc], dim=1)
+            xt_x1 = torch.cat([x1_bc, y_bc, t_bc], dim=1)
+            loss_bc_x_ = mse_loss(model(xt_x0), model(xt_x1))
+
+            xt_y0 = torch.cat([x_bc, y0_bc, t_bc], dim=1)
+            xt_y1 = torch.cat([x_bc, y1_bc, t_bc], dim=1)
+            loss_bc_y_ = mse_loss(model(xt_y0), model(xt_y1))
+
+            r_ = pde_residual(model, x_f, y_f, t_f)
+            loss_pde_ = mse_loss(r_, torch.zeros_like(r_))
+
+            loss_ = loss_ic_ + loss_bc_x_ + loss_bc_y_ + loss_pde_
+            loss_.backward()
+            return loss_
+
+        optimizer_lbfgs.step(closure)
+        print("LBFGS finished.")
+
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time:.1f}s")
+    return model
+
+
+# ---------------------
+# Evaluation & plotting
+# ---------------------
+def evaluate_and_plot(model: nn.Module):
+    model.eval()
+    nx, ny = 128, 128
+    nt_plot = 4
+    x = np.linspace(x_min, x_max, nx)
+    y = np.linspace(y_min, y_max, ny)
+    t_vals = np.linspace(t_min, t_max, nt_plot)
+    X, Y = np.meshgrid(x, y, indexing="xy")
+
+    fig, axes = plt.subplots(2, nt_plot, figsize=(4 * nt_plot, 8))
+    for i, tt in enumerate(t_vals):
+        xt = np.vstack([X.flatten(), Y.flatten(), np.ones_like(X.flatten()) * tt]).T
+        xt_tensor = to_tensor(xt).to(device)
+        with torch.no_grad():
+            u_pred = model(xt_tensor).cpu().numpy().reshape(ny, nx)
+
+        u_exact = analytic_solution(X, Y, tt)
+
+        # plot exact and predicted
+        ax1 = axes[0, i]
+        pcm = ax1.pcolormesh(x, y, u_exact, shading="auto", cmap="viridis")
+        ax1.set_title(f"Exact t={tt:.3f}")
+        fig.colorbar(pcm, ax=ax1)
+
+        ax2 = axes[1, i]
+        pcm2 = ax2.pcolormesh(x, y, u_pred, shading="auto", cmap="viridis")
+        ax2.set_title(f"HWF-PIKAN t={tt:.3f}")
+        fig.colorbar(pcm2, ax=ax2)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Compute relative L2 error over whole space-time grid
+    nx_grid, ny_grid, nt_grid = 64, 64, 16
+    xs = np.linspace(x_min, x_max, nx_grid)
+    ys = np.linspace(y_min, y_max, ny_grid)
+    ts = np.linspace(t_min, t_max, nt_grid)
+    XX, YY, TT = np.meshgrid(xs, ys, ts, indexing="xy")
+    xt_grid = np.vstack([XX.flatten(), YY.flatten(), TT.flatten()]).T
+    with torch.no_grad():
+        u_pred_grid = model(to_tensor(xt_grid).to(device)).cpu().numpy().flatten()
+    u_exact_grid = analytic_solution(XX.flatten(), YY.flatten(), TT.flatten())
+    rel_l2 = np.linalg.norm(u_pred_grid - u_exact_grid) / np.linalg.norm(u_exact_grid)
+    print(f"Relative L2 error on coarse space-time grid: {rel_l2:.3e}")
+
+
+# ---------------------
+# Run
+# ---------------------
+if __name__ == "__main__":
+    model_trained = train()
+    evaluate_and_plot(model_trained)
