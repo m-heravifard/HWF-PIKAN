@@ -685,3 +685,4 @@ for row_idx, t_val in enumerate(times_to_plot):
     fig.colorbar(im3, ax=ax_err, fraction=0.046, pad=0.04)
 
 plt.show()
+
