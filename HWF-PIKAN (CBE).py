@@ -1,31 +1,7 @@
 #!/usr/bin/env python3
 """
 Authors: Mohammad E. Heravifard & Prof. Kazem Hejranfar
-HWF-PIKAN-Spline PINN for the collisionless Boltzmann equation (no force term):
-
-    ∂f/∂t + v * ∂f/∂x = 0
-
-with Gaussian initial condition in (x, v):
-
-    f(0, x, v) = exp( - (x^2 + v^2) / sigma^2 )
-
-Domain:
-    t ∈ [0, T]
-    x ∈ [-Lx, Lx]
-    v ∈ [-Lv, Lv]
-
-Periodic boundary condition in x:
-    f(t, -Lx, v) = f(t, +Lx, v)
-
-Architecture:
-    - Characteristic coordinate: y = x - v t (wrapped into [-Lx, Lx]),
-      so f(t,x,v) = Net(y,v).
-    - Hybrid Wavelet–Fourier (HWF) embedding on (y,v)
-      (Fourier sin/cos + multiscale Ricker wavelets + LayerNorm).
-    - KAN/B-spline core (KA): inner scalar maps -> s_q ∈ [0,1],
-      univariate phi_q(s_q) represented by cubic B-splines,
-      outer linear combination yields f.
-    - Physics-informed losses: PDE residual, IC, periodic BCs.
+HWF-PIKAN-Spline PINN for the collisionless Boltzmann equation (no force term)
 """
 
 import numpy as np
@@ -685,4 +661,5 @@ for row_idx, t_val in enumerate(times_to_plot):
     fig.colorbar(im3, ax=ax_err, fraction=0.046, pad=0.04)
 
 plt.show()
+
 
